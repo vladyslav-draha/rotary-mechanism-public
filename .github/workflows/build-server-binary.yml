@@ -29,6 +29,9 @@ jobs:
   build:
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 120
+    # Secret PRIVATE_REPOS_TOKEN lives in this Environment, not in
+    # repository Secrets: without this line the token is not visible.
+    environment: RotaryMechanismPublic
     defaults:
       run:
         working-directory: server
