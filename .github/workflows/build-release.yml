@@ -1,0 +1,302 @@
+name: Build release archive
+
+# Manual dispatch only: builds the full AirUnit product (backend binary +
+# frontend dist) as ONE archive for offline deployment to a Pi without
+# internet access.
+#
+# Inputs: server_ref / frontend_ref (branch, tag or SHA of the private
+# repos, default main) and an optional release_tag
+# (empty = build + smoke tests only, no Release).
+#
+# NOTE: the backend binary targets the BUILD machine: ubuntu-22.04-arm
+# (glibc 2.35) runs on DietPi Bookworm (glibc 2.36). Do NOT move the
+# backend job to ubuntu-24.04-arm without re-checking glibc
+# compatibility. The frontend build is architecture-independent.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - build.conf
+      - .github/workflows/build-release.yml
+  pull_request:
+    paths:
+      - build.conf
+      - .github/workflows/build-release.yml
+  workflow_dispatch:
+    inputs:
+      server_ref:
+        description: "Server branch, tag or SHA (empty = use build.conf)"
+        required: false
+        default: ""
+      frontend_ref:
+        description: "Frontend branch, tag or SHA (empty = use build.conf)"
+        required: false
+        default: ""
+      release_tag:
+        description: "Release tag (empty = use build.conf)"
+        required: false
+        default: ""
+
+# A config edit while a build is running cancels the stale run.
+concurrency:
+  group: build-release
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      server_ref: ${{ steps.cfg.outputs.server_ref }}
+      frontend_ref: ${{ steps.cfg.outputs.frontend_ref }}
+      release_tag: ${{ steps.cfg.outputs.release_tag }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Resolve refs (dispatch wins, build.conf is the default)
+        id: cfg
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          . ./build.conf
+          set +a
+          R_SERVER="${{ inputs.server_ref }}"
+          R_FRONT="${{ inputs.frontend_ref }}"
+          R_TAG="${{ inputs.release_tag }}"
+          [ -n "$R_SERVER" ] || R_SERVER="$SERVER_REF"
+          [ -n "$R_FRONT" ] || R_FRONT="$FRONTEND_REF"
+          [ -n "$R_TAG" ] || R_TAG="$RELEASE_TAG"
+          : "${R_SERVER:?SERVER_REF is empty}"
+          : "${R_FRONT:?FRONTEND_REF is empty}"
+          echo "server_ref=$R_SERVER" >> "$GITHUB_OUTPUT"
+          echo "frontend_ref=$R_FRONT" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$R_TAG" >> "$GITHUB_OUTPUT"
+          echo "server=$R_SERVER frontend=$R_FRONT release=[$R_TAG]"
+
+  build-server:
+    needs: resolve
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 120
+    # Secret PRIVATE_REPOS_TOKEN lives in this Environment, not in
+    # repository Secrets: without this line the token is not visible.
+    # The token needs Contents: read on BOTH private repos
+    # (rotary-mechanism-server and rotary-mechanism-frontend).
+    environment: RotaryMechanismPublic
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout server at requested ref
+        uses: actions/checkout@v4
+        with:
+          repository: vladyslav-draha/rotary-mechanism-server
+          ref: ${{ needs.resolve.outputs.server_ref }}
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
+          path: server
+
+      - name: Record resolved SHA
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "server $SHA"
+          echo "$SHA" > server-sha.txt
+
+      - name: Install build tools
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y --no-install-recommends gcc patchelf ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-22.04-arm-${{ hashFiles('server/uv.lock') }}
+          restore-keys: ccache-22.04-arm-
+
+      - name: Set up uv and Python 3.14
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+
+      - name: Sync runtime dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Build onefile binary with Nuitka
+        # --nofollow-import-to=pydantic.v1: Nuitka 4.x miscompiles
+        # pydantic.v1 under 3.14 (NameError: SetStr); the app uses
+        # pydantic v2 only and FastAPI tolerates the missing v1 shim.
+        run: |
+          uv run --no-dev --with nuitka -- python -m nuitka \
+            --standalone \
+            --onefile \
+            --assume-yes-for-downloads \
+            --jobs="$(nproc)" \
+            --output-dir=build \
+            --output-filename=airunit-server \
+            --nofollow-import-to=pydantic.v1 \
+            main.py
+
+      - name: "Smoke test 1: boot without serial port"
+        # The binary must get through all imports and fail exactly
+        # where the source version fails (no serial hardware on CI).
+        run: |
+          rm -rf /tmp/smoke1 && mkdir -p /tmp/smoke1 && cd /tmp/smoke1
+          if UART_PORT=/dev/does-not-exist \
+             LOG_FILE=/tmp/smoke1/app.log \
+             STORAGE_DIR=/tmp/smoke1/storage \
+             "$GITHUB_WORKSPACE/server/build/airunit-server" --non-interactive 2>&1 \
+             | grep -q "failed to open serial port"; then
+            echo "boot-through-imports OK"
+          else
+            echo "binary failed before serial init"; exit 1
+          fi
+
+      - name: "Smoke test 2: full boot with PTY + HTTP"
+        run: |
+          rm -rf /tmp/smoke2 && mkdir -p /tmp/smoke2 && cd /tmp/smoke2
+          python3 -c "import pty,os,time; m,s=pty.openpty(); print(os.ttyname(s),flush=True); time.sleep(90)" > pty.txt 2>&1 &
+          sleep 1
+          SLAVE=$(cat pty.txt)
+          UART_PORT="$SLAVE" \
+          LOG_FILE=/tmp/smoke2/app.log \
+          STORAGE_DIR=/tmp/smoke2/storage \
+          "$GITHUB_WORKSPACE/server/build/airunit-server" --non-interactive > server.log 2>&1 &
+          SRV=$!
+          sleep 10
+          curl -fsS --max-time 10 http://localhost:8000/openapi.json > /dev/null
+          curl -fsS --max-time 10 http://localhost:8000/docs > /dev/null
+          kill "$SRV"
+          echo "HTTP smoke OK"
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-part
+          path: |
+            server/build/airunit-server
+            server/server-sha.txt
+
+  build-frontend:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: RotaryMechanismPublic
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout frontend at requested ref
+        uses: actions/checkout@v4
+        with:
+          repository: vladyslav-draha/rotary-mechanism-frontend
+          ref: ${{ needs.resolve.outputs.frontend_ref }}
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
+          path: frontend
+
+      - name: Record resolved SHA
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "frontend $SHA"
+          echo "$SHA" > frontend-sha.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build dist
+        # VITE_API_URL / VITE_WS_BASE are deliberately NOT set: without
+        # them the frontend talks to http(s)://<page host>:8000, so one
+        # build works on any device.
+        run: |
+          npm ci
+          env -u VITE_API_URL -u VITE_WS_BASE npm run build
+          test -f dist/index.html
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-part
+          path: |
+            frontend/dist/
+            frontend/frontend-sha.txt
+
+  package:
+    needs: [resolve, build-server, build-frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download parts
+        uses: actions/download-artifact@v4
+        with:
+          path: parts
+
+      - name: Assemble single release archive
+        # Files are located by name on purpose: the on-disk layout of
+        # downloaded artifacts is not something to rely on.
+        run: |
+          BIN=$(find parts -name airunit-server -type f | head -1)
+          SSHA=$(find parts -name server-sha.txt -type f | head -1)
+          FSHA=$(find parts -name frontend-sha.txt -type f | head -1)
+          DIST=$(dirname "$(find parts -path "*dist/index.html" | head -1)")
+          : "${BIN:?server binary not found}"
+          : "${SSHA:?server SHA not found}"
+          : "${FSHA:?frontend SHA not found}"
+          : "${DIST:?frontend dist not found}"
+          STAGE="$(pwd)/stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE/frontend-dist"
+          cp "$BIN" "$STAGE/airunit-server-aarch64"
+          chmod +x "$STAGE/airunit-server-aarch64"
+          cp -a "$DIST/." "$STAGE/frontend-dist/"
+          cat > "$STAGE/version.json" <<EOF
+          {
+            "server_ref": "${{ needs.resolve.outputs.server_ref }}",
+            "server_sha": "$(cat "$SSHA")",
+            "frontend_ref": "${{ needs.resolve.outputs.frontend_ref }}",
+            "frontend_sha": "$(cat "$FSHA")",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          tar -czf airunit-release.tar.gz -C "$STAGE" \
+            airunit-server-aarch64 frontend-dist version.json
+          sha256sum airunit-release.tar.gz > airunit-release.tar.gz.sha256
+          tar -tzf airunit-release.tar.gz
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: airunit-release
+          path: |
+            airunit-release.tar.gz
+            airunit-release.tar.gz.sha256
+
+  release:
+    needs: [resolve, package]
+    if: needs.resolve.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: airunit-release
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          generate_release_notes: true
+          body: |
+            Server ref: `${{ needs.resolve.outputs.server_ref }}`
+            Frontend ref: `${{ needs.resolve.outputs.frontend_ref }}`
+            Exact SHAs are recorded in `version.json` inside the archive.
+          files: |
+            airunit-release.tar.gz
+            airunit-release.tar.gz.sha256
